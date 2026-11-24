@@ -1,4 +1,4 @@
-
+ 
 # TidyTrail
 
 A tiny Python script that sorts files into folders based on their type: **Images**, **Documents**, **Videos**, **Audio**, **Code**, **Archives**, and **Other**.
