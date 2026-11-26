@@ -1,5 +1,3 @@
-"""Organize the files in a folder by type. Preview by default."""
-
 import argparse
 import shutil
 from pathlib import Path
