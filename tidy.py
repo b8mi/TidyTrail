@@ -1,8 +1,11 @@
+
 import argparse
+import json
 import shutil
 from collections import defaultdict
 from pathlib import Path
 
+HISTORY_FILE = ".tidytrail-undo.json"
 
 CATEGORIES = {
     "Images": {".png", ".jpg", ".jpeg", ".gif", ".webp", ".svg", ".bmp", ".ico", ".tiff", ".heic"},
@@ -30,22 +33,27 @@ def file_extension(file):
 def category_for(file):
     extension = file_extension(file)
 
-    for name, extensions in CATEGORIES.items():
+    for category, extensions in CATEGORIES.items():
         if extension in extensions:
-            return name
+            return category
 
     return "Other"
 
 
+def occupied(path):
+    return path.exists() or path.is_symlink()
+
+
 def available_path(destination, reserved):
-    candidate = destination
     extension = file_extension(destination)
-    original_suffix = destination.name[-len(extension):] if extension else ""
+    suffix = destination.name[-len(extension):] if extension else ""
     stem = destination.name[:-len(extension)] if extension else destination.name
+
+    candidate = destination
     number = 1
 
-    while candidate.exists() or candidate.is_symlink() or candidate in reserved:
-        candidate = destination.with_name(f"{stem} ({number}){original_suffix}")
+    while occupied(candidate) or candidate in reserved:
+        candidate = destination.with_name(f"{stem} ({number}){suffix}")
         number += 1
 
     reserved.add(candidate)
@@ -53,37 +61,41 @@ def available_path(destination, reserved):
 
 
 def format_size(size):
-    units = ("B", "KB", "MB", "GB", "TB", "PB")
     value = float(size)
 
-    for unit in units:
-        if value < 1024 or unit == units[-1]:
+    for unit in ("B", "KB", "MB", "GB", "TB", "PB"):
+        if value < 1024 or unit == "PB":
             return f"{value:.2f} {unit}"
-
         value /= 1024
 
 
-def is_eligible(source, script):
-    return source.is_file() and not source.is_symlink() and source.resolve() != script
-
-
-def validate_destination(directory):
+def validate_directory(directory):
     if directory.is_symlink():
-        raise ValueError("Destination is a symbolic link.")
+        raise ValueError("Symbolic link destination.")
 
     if directory.exists() and not directory.is_dir():
-        raise ValueError("A file is blocking the destination folder.")
+        raise ValueError("Destination is not a directory.")
+
+
+def is_eligible(source):
+    if source.name in (HISTORY_FILE, HISTORY_FILE + ".tmp"):
+        return False
+
+    return (
+        source.is_file()
+        and not source.is_symlink()
+        and source.resolve() != Path(__file__).resolve()
+    )
 
 
 def build_plan(folder, selected_category=None):
     reserved = set()
-    script = Path(__file__).resolve()
     plan = []
     skipped = []
 
     for source in sorted(folder.iterdir()):
         try:
-            if not is_eligible(source, script):
+            if not is_eligible(source):
                 continue
 
             category = category_for(source)
@@ -92,12 +104,10 @@ def build_plan(folder, selected_category=None):
                 continue
 
             directory = folder / category
-            validate_destination(directory)
+            validate_directory(directory)
 
-            size = source.stat().st_size
             target = available_path(directory / source.name, reserved)
-
-            plan.append((source, target, category, size))
+            plan.append((source, target, category, source.stat().st_size))
 
         except (OSError, ValueError) as error:
             skipped.append((source.name, str(error)))
@@ -105,99 +115,241 @@ def build_plan(folder, selected_category=None):
     return plan, skipped
 
 
-def calculate_statistics(plan):
+def print_summary(plan):
     statistics = defaultdict(lambda: {"count": 0, "size": 0})
 
     for source, target, category, size in plan:
         statistics[category]["count"] += 1
         statistics[category]["size"] += size
 
-    return statistics
-
-
-def print_summary(plan):
-    statistics = calculate_statistics(plan)
-    total_size = sum(item[3] for item in plan)
-
     print("\nCATEGORY BREAKDOWN")
-    print("-" * 45)
+    print("-" * 50)
 
     for category, data in sorted(statistics.items()):
-        count = data["count"]
-        size = format_size(data["size"])
+        print(f"{category:<18} {data['count']:>5} files  {format_size(data['size']):>10}")
 
-        print(f"{category:<18} {count:>5} file(s)  {size:>10}")
-
-    print("-" * 45)
+    print("-" * 50)
     print(f"Total files: {len(plan)}")
-    print(f"Total size:  {format_size(total_size)}")
+    print(f"Total size: {format_size(sum(item[3] for item in plan))}")
 
     if plan:
         largest = max(plan, key=lambda item: item[3])
         print(f"Largest file: {largest[0].name} ({format_size(largest[3])})")
 
 
-def execute_move(source, target, reserved):
-    validate_destination(target.parent)
-    target.parent.mkdir(exist_ok=True)
+def save_history(folder, records):
+    history = folder / HISTORY_FILE
+    temporary = folder / (HISTORY_FILE + ".tmp")
 
-    if target.exists() or target.is_symlink():
-        target = available_path(target, reserved)
+    if history.is_symlink() or occupied(temporary):
+        raise ValueError("Unsafe history file location.")
 
-    shutil.move(str(source), str(target))
-    return target
+    try:
+        with temporary.open("x", encoding="utf-8") as file:
+            json.dump(records, file, indent=2)
+
+        temporary.replace(history)
+
+    finally:
+        if temporary.is_file() and not temporary.is_symlink():
+            temporary.unlink(missing_ok=True)
+
+
+def load_history(folder):
+    history = folder / HISTORY_FILE
+
+    if history.is_symlink():
+        raise ValueError("Unsafe history file.")
+
+    if not history.exists():
+        return []
+
+    records = json.loads(history.read_text(encoding="utf-8"))
+
+    if not isinstance(records, list):
+        raise ValueError("Invalid undo history.")
+
+    return records
+
+
+def signature(path):
+    stat = path.stat()
+    return [stat.st_size, stat.st_mtime_ns]
+
+
+def create_record(folder, source, target):
+    return {
+        "original": str(source.relative_to(folder)),
+        "organized": str(target.relative_to(folder)),
+        "signature": signature(source)
+    }
+
+
+def record_paths(folder, record):
+    original = Path(record["original"])
+    organized = Path(record["organized"])
+
+    if original.is_absolute() or organized.is_absolute():
+        raise ValueError("Invalid recorded path.")
+
+    if len(original.parts) != 1 or len(organized.parts) != 2:
+        raise ValueError("Invalid recorded location.")
+
+    if ".." in original.parts or ".." in organized.parts:
+        raise ValueError("Unsafe recorded path.")
+
+    if organized.parts[0] not in [*CATEGORIES, "Other"]:
+        raise ValueError("Unknown category.")
+
+    source = folder / organized
+    target = folder / original
+
+    validate_directory(source.parent)
+
+    if source.is_symlink() or target.is_symlink():
+        raise ValueError("Symbolic links are not supported.")
+
+    return source, target
 
 
 def organize(folder, apply=False, selected_category=None):
     folder = Path(folder).resolve()
     plan, skipped = build_plan(folder, selected_category)
-    reserved = {item[1] for item in plan}
 
+    reserved = {item[1] for item in plan}
     completed = []
+    records = []
 
     print("\nAPPLY MODE" if apply else "\nPREVIEW MODE")
-    print("-" * 45)
+    print("-" * 50)
+
+    if apply and plan and load_history(folder):
+        print("Warning: this operation replaces the previous undo history.")
+
+        if input("Continue? [y/N]: ").strip().lower() not in ("y", "yes"):
+            return
 
     for source, target, category, size in plan:
         try:
             if apply:
-                target = execute_move(source, target, reserved)
+                validate_directory(target.parent)
+                target.parent.mkdir(exist_ok=True)
 
-            print(f"{source.name} -> {target.relative_to(folder)}")
+                if occupied(target):
+                    target = available_path(target, reserved)
+
+                record = create_record(folder, source, target)
+
+                # Record the intended move before changing the files.
+                save_history(folder, records + [record])
+
+                try:
+                    shutil.move(str(source), str(target))
+                except (OSError, shutil.Error):
+                    # Keep the record for recovery if the move was partial.
+                    raise
+
+                records.append(record)
+
             completed.append((source, target, category, size))
+            print(f"{source.name} -> {target.relative_to(folder)}")
 
         except (OSError, ValueError, shutil.Error) as error:
             skipped.append((source.name, str(error)))
 
+            if apply:
+                print("Stopped to preserve the undo history.")
+                break
+
     print_summary(completed)
 
-    if skipped:
-        print("\nSKIPPED FILES")
+    for name, reason in skipped:
+        print(f"Skipped {name}: {reason}")
 
-        for name, reason in skipped:
-            print(f"  {name}: {reason}")
+    if apply:
+        print(f"\n{len(completed)} file(s) organized.")
 
-    status = "organized" if apply else "previewed (nothing moved)"
-    print(f"\n{len(completed)} file(s) {status}.")
-    print(f"{len(skipped)} file(s) skipped.")
+        if records:
+            print('Restore using: python tidy.py "FOLDER" --undo')
+    else:
+        print("\nPreview finished. No files were moved.")
+
+
+def undo(folder):
+    folder = Path(folder).resolve()
+    records = load_history(folder)
+
+    if not records:
+        print("No previous organization found.")
+        return
+
+    restored = 0
+    remaining = records.copy()
+
+    for index in range(len(records) - 1, -1, -1):
+        record = records[index]
+
+        try:
+            source, target = record_paths(folder, record)
+
+            if not occupied(source) and target.is_file():
+                # Already restored, or the original move never finished.
+                if signature(target) != record["signature"]:
+                    raise ValueError("Original file has changed.")
+
+            else:
+                if not source.is_file():
+                    raise ValueError("Organized file is missing.")
+
+                if occupied(target):
+                    raise ValueError("Original location is occupied.")
+
+                if signature(source) != record["signature"]:
+                    raise ValueError("Organized file has changed.")
+
+                shutil.move(str(source), str(target))
+                restored += 1
+
+            remaining.pop(index)
+            save_history(folder, remaining)
+
+            print(f"Restored: {target.name}")
+
+        except (OSError, ValueError, KeyError, TypeError, shutil.Error) as error:
+            print(f"Skipped undo entry: {error}")
+
+    print(f"\n{restored} file(s) restored.")
+    print(f"{len(remaining)} unresolved undo entries.")
+
+    if not remaining:
+        print("Undo completed.")
 
 
 def main():
-    parser = argparse.ArgumentParser(description="Sort files into folders by type.")
+    parser = argparse.ArgumentParser(description="Organize files by type.")
+    parser.add_argument("folder", type=Path)
 
-    parser.add_argument("folder", type=Path, help="Folder to organize")
-    parser.add_argument("--apply", action="store_true", help="Actually move files")
-    parser.add_argument("--category", choices=[*CATEGORIES, "Other"], help="Organize only the selected category")
+    modes = parser.add_mutually_exclusive_group()
+    modes.add_argument("--apply", action="store_true")
+    modes.add_argument("--undo", action="store_true")
+
+    parser.add_argument("--category", choices=[*CATEGORIES, "Other"])
 
     args = parser.parse_args()
 
     if not args.folder.is_dir():
-        parser.error("The folder does not exist or is not a directory.")
+        parser.error("Folder does not exist.")
+
+    if args.undo and args.category:
+        parser.error("--category cannot be combined with --undo.")
 
     try:
-        organize(args.folder.resolve(), args.apply, args.category)
+        if args.undo:
+            undo(args.folder)
+        else:
+            organize(args.folder, args.apply, args.category)
 
-    except OSError as error:
+    except (OSError, ValueError) as error:
         parser.exit(1, f"Error: {error}\n")
 
 
